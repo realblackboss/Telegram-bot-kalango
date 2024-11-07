@@ -49,56 +49,207 @@ def get_db_path():
         os.makedirs(db_dir)
     return os.path.join(db_dir, 'bot.db')
 
-# Função para exibir o menu de registro, login, recuperação de senha, suporte e seleção de idioma
+# Gerenciador de contexto para conexão ao banco de dados
+@contextmanager
+def db_connection():
+    db_path = get_db_path()
+    conn = sqlite3.connect(db_path)
+    try:
+        yield conn
+    except sqlite3.Error as e:
+        logger.error(f"Erro ao conectar ao banco de dados {db_path}: {e}")
+        raise
+    finally:
+        conn.close()
+
+# Inicializar o banco de dados
+def init_db():
+    with db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute('''
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            telegram_id INTEGER UNIQUE NOT NULL,
+            email TEXT UNIQUE NOT NULL,
+            password TEXT NOT NULL,
+            whatsapp_number TEXT,
+            expiration_date DATETIME,
+            first_login DATETIME,
+            last_login DATETIME,
+            banned BOOLEAN DEFAULT FALSE
+        )
+        ''')
+        cursor.execute('''
+        CREATE TABLE IF NOT EXISTS groups (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            group_name TEXT NOT NULL,
+            link TEXT NOT NULL,
+            FOREIGN KEY(user_id) REFERENCES users(id),
+            UNIQUE(group_name, link)
+        )
+        ''')
+        cursor.execute('''
+        CREATE TABLE IF NOT EXISTS scheduled_messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            group_id INTEGER,
+            message_type TEXT NOT NULL,
+            message_content TEXT NOT NULL,
+            message_caption TEXT,
+            scheduled_time TEXT NOT NULL,
+            message_thumbnail TEXT,
+            FOREIGN KEY(user_id) REFERENCES users(id),
+            FOREIGN KEY(group_id) REFERENCES groups(id)
+        )
+        ''')
+        conn.commit()
+
+# Inicializar o banco de dados na inicialização
+init_db()
+
+# Função auxiliar para verificar se uma mensagem foi modificada antes de editá-la
+async def safe_edit_message_text(query, text, reply_markup=None):
+    """Função auxiliar para editar uma mensagem com segurança, evitando o erro de mensagem não modificada."""
+    try:
+        if query.message.text != text or (query.message.reply_markup and query.message.reply_markup.inline_keyboard != reply_markup.inline_keyboard):
+            await query.edit_message_text(text=text, reply_markup=reply_markup)
+        else:
+            logger.warning("A mensagem não foi modificada. Nenhuma edição foi realizada.")
+    except telegram.error.BadRequest as e:
+        logger.error(f"Erro ao editar a mensagem: {e}")
+
+# Função auxiliar para deletar uma mensagem com segurança
+async def safe_delete_message(bot, chat_id, message_id):
+    try:
+        await bot.delete_message(chat_id=chat_id, message_id=message_id)
+    except telegram.error.BadRequest as e:
+        logger.warning(f"Falha ao deletar a mensagem: {e}")
+
+# Função para verificar se o e-mail ou telegram_id já existe no banco de dados
+def user_exists(telegram_id, email):
+    with db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute('SELECT id FROM users WHERE telegram_id=? OR email=?', (telegram_id, email))
+        return cursor.fetchone() is not None
+
+# Função para bloquear usuários com datas de expiração vencidas
+def block_expired_users():
+    with db_connection() as conn:
+        cursor = conn.cursor()
+        now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        cursor.execute('UPDATE users SET banned = 1 WHERE expiration_date < ? AND banned = 0', (now,))
+        conn.commit()
+        logger.info("Usuários expirados bloqueados com sucesso.")
+
+# Agendar a verificação de usuários expirados diariamente
+scheduler.add_job(block_expired_users, 'cron', hour=0, minute=0)
+
+# Função para adicionar um usuário com a senha fornecida (hashed)
+def add_user(telegram_id, email, password, whatsapp_number, expiration_date):
+    if user_exists(telegram_id, email):
+        logger.info(f"Usuário com email {email} ou telegram_id {telegram_id} já existe.")
+        return None  # Retornar None se o usuário já existir
+
+    hashed_password = bcrypt.hashpw(password.encode('utf-8'), bcrypt.gensalt())
+    with db_connection() as conn:
+        try:
+            cursor = conn.cursor()
+            cursor.execute(
+                'INSERT INTO users (telegram_id, email, password, whatsapp_number, expiration_date, banned) VALUES (?, ?, ?, ?, ?, 1)',
+                (telegram_id, email, hashed_password, whatsapp_number, expiration_date)
+            )
+            conn.commit()
+            return cursor.lastrowid
+        except sqlite3.Error as e:
+            logger.error(f"Erro ao adicionar o usuário {telegram_id}: {e}")
+            return None
+
+# Função para verificar as credenciais do usuário e atualizar o primeiro e último login
+def check_user(email, password):
+    with db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute('SELECT id, password, banned, expiration_date, first_login, last_login FROM users WHERE email=?', (email,))
+        result = cursor.fetchone()
+
+        if result:
+            user_id, stored_password, banned, expiration_date, first_login, last_login = result
+
+            # Verificar se o usuário está banido
+            if banned:
+                logger.info(f"Usuário {email} está banido.")
+                return "banned"
+
+            # Verificar se a data de expiração passou
+            if expiration_date and datetime.now() > datetime.strptime(expiration_date, "%Y-%m-%d %H:%M:%S.%f"):
+                # Bloquear o usuário
+                cursor.execute('UPDATE users SET banned = 1 WHERE id = ?', (user_id,))
+                conn.commit()
+                logger.info(f"Usuário {email} bloqueado devido à expiração.")
+                return "banned"
+
+            # Verificar se a senha está correta
+            if bcrypt.checkpw(password.encode('utf-8'), stored_password):
+                now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+
+                # Registrar primeiro login se ainda não estiver registrado
+                if not first_login:
+                    cursor.execute('UPDATE users SET first_login = ? WHERE id = ?', (now, user_id))
+                
+                # Atualizar último login
+                cursor.execute('UPDATE users SET last_login = ? WHERE id = ?', (now, user_id))
+                conn.commit()
+
+                return user_id
+            else:
+                logger.info(f"Senha incorreta para o usuário {email}.")
+                return None
+        else:
+            logger.info(f"Usuário {email} não encontrado.")
+            return None
+
+# Função para verificar se o usuário está registrado e não banido
+def is_user_registered_and_not_banned(telegram_id):
+    with db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute('SELECT banned FROM users WHERE telegram_id=?', (telegram_id,))
+        result = cursor.fetchone()
+        return result and not result[0]
+
+# Função auxiliar para validar o formato de horário
+def is_valid_time_format(time_str):
+    time_pattern = r'^(0[0-9]|1[0-9]|2[0-3]):[0-5][0-9]$'
+    return re.match(time_pattern, time_str) is not None
+
+# Função auxiliar para validar e converter a data/hora de entrada
+def parse_schedule_time(schedule_time):
+    possible_formats = [
+        "%d-%m-%Y %H:%M",  # formato original
+        "%d/%m/%Y %H:%M",  # com barras
+        "%d-%m-%y %H:%M",  # com ano de 2 dígitos
+        "%d/%m/%y %H:%M",  # com barras e ano de 2 dígitos
+        "%d %m %Y %H:%M",  # com espaços
+        "%d %m %y %H:%M"   # com espaços e ano de 2 dígitos
+    ]
+    
+    schedule_time = schedule_time.strip()
+
+    for fmt in possible_formats:
+        try:
+            return datetime.strptime(schedule_time, fmt)
+        except ValueError:
+            continue
+    return None
+
+# Função para exibir o menu de registro, login, recuperação de senha, suporte e sobre
 def start_menu_keyboard():
     keyboard = [
         [InlineKeyboardButton("Registrar 📝", callback_data='register')],
         [InlineKeyboardButton("Entrar 🔑", callback_data='login')],
-        [InlineKeyboardButton("Sobre ℹ️", callback_data='sobre')],
-        [InlineKeyboardButton("Selecionar Idioma 🌐", callback_data='select_language')],
+        [InlineKeyboardButton("Sobre ℹ️", callback_data='sobre')],  # Botão de Sobre
         [InlineKeyboardButton("Suporte ☎️", url=f"https://wa.me/{WHATSAPP_NUMBER.replace('+', '')}?text={WHATSAPP_MESSAGE_REGISTRATION.replace(' ', '%20')}")]
     ]
     return InlineKeyboardMarkup(keyboard)
-
-# Função para exibir as opções de idiomas ao clicar no botão "Selecionar Idioma"
-async def handle_select_language(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    query = update.callback_query
-    await query.answer()
-
-    # Cria um teclado com as opções de idiomas e um botão para voltar ao menu principal
-    keyboard = [
-        [InlineKeyboardButton("Português 🇧🇷", callback_data='set_language_pt')],
-        [InlineKeyboardButton("English 🇬🇧", callback_data='set_language_en')],
-        [InlineKeyboardButton("中文 🇨🇳", callback_data='set_language_zh')],
-        [InlineKeyboardButton("Voltar ao Menu Principal 🔙", callback_data='menu_registro')]
-    ]
-    
-    await query.edit_message_text(
-        text="Escolha o idioma:",
-        reply_markup=InlineKeyboardMarkup(keyboard)
-    )
-
-# Funções para definir o idioma
-async def set_language_pt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    query = update.callback_query
-    await query.answer()
-    context.user_data['language'] = 'pt'
-    await query.edit_message_text("Idioma definido para Português. Retornando ao menu principal...")
-    await start(update, context)
-
-async def set_language_en(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    query = update.callback_query
-    await query.answer()
-    context.user_data['language'] = 'en'
-    await query.edit_message_text("Language set to English. Returning to the main menu...")
-    await start(update, context)
-
-async def set_language_zh(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    query = update.callback_query
-    await query.answer()
-    context.user_data['language'] = 'zh'
-    await query.edit_message_text("语言设置为中文。返回主菜单...")
-    await start(update, context)
 
 # Função para exibir as opções de idiomas ao clicar no botão "Sobre"
 async def handle_sobre(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1193,13 +1344,7 @@ def main():
     application.add_handler(CallbackQueryHandler(handle_sobre_en, pattern='^sobre_en$'))
     application.add_handler(CallbackQueryHandler(handle_sobre_zh, pattern='^sobre_zh$'))
 
-    # Handler para a seleção de idioma
-    application.add_handler(CallbackQueryHandler(handle_select_language, pattern='^select_language$'))
-    application.add_handler(CallbackQueryHandler(set_language_pt, pattern='^set_language_pt$'))
-    application.add_handler(CallbackQueryHandler(set_language_en, pattern='^set_language_en$'))
-    application.add_handler(CallbackQueryHandler(set_language_zh, pattern='^set_language_zh$'))
-
-    # Outros handlers existentes
+    # Outros handlers
     application.add_handler(CallbackQueryHandler(handle_register_selection, pattern='^register$'))
     application.add_handler(CallbackQueryHandler(handle_login_selection, pattern='^login$'))
     application.add_handler(CallbackQueryHandler(handle_menu_register, pattern='menu_registro'))
